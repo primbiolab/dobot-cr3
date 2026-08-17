@@ -87,3 +87,13 @@ disponible.
 - [DEPLOY.md](DEPLOY.md) — los dos nombres de dominio y el procedimiento para
   desplegar cada componente.
 
+---
+
+## 📜 Créditos y Contexto
+
+Desarrollado en la Universidad Nacional de Colombia, Sede La Paz, en el marco de las actividades académicas de sus autores.
+
+---
+## Afiliación institucional
+
+Escuela de Pregrado, Dirección Académica, Vicerrectoría de Sede, Universidad Nacional de Colombia, Sede La Paz, Cesar, Colombia.

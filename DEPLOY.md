@@ -47,6 +47,30 @@ npm run typecheck && npm run lint && npm run build
 npx wrangler deploy
 ```
 
+### The control lease lives in a Durable Object
+
+`wrangler.jsonc` binds `CONTROL_LEASE` to the `ControlLeaseDO` class, and
+`worker/index.ts` is the entry point that exports it alongside the generated
+OpenNext worker. Nothing to configure: the migration in `wrangler.jsonc`
+creates the namespace on the first deploy that carries it.
+
+This is not optional dressing. The Worker runs in as many isolates as
+Cloudflare decides to give it, and the fallback in-memory lease store is
+per-isolate — with it, two people were each granted control of the arm and
+each minted a valid lease token. If the binding is ever missing the app says
+so in the logs, refuses to mint any lease token, and the lab is view-only.
+
+A Durable Object has no Pub/Sub, so the spectator stream polls it: each open
+tab costs roughly one request every two seconds plus its presence refresh. A
+handful of viewers is a few requests a second — worth knowing if a whole class
+leaves the lab open, since Durable Object requests are metered.
+
+Confirm it is really there after deploying:
+
+```bash
+npx wrangler versions view <version-id> --name dobot-cr3   # expect env.CONTROL_LEASE
+```
+
 Production environment goes in the Worker, not in a file:
 
 ```bash

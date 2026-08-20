@@ -181,11 +181,36 @@ class TokenVerifier:
 
 
 class LeaseVerifier:
-    """Verifies the short-lived control-lease token minted by the lab app."""
+    """Verifies the control-lease token, and arbitrates who is actually driving.
+
+    Verifying the token is not by itself enough to guarantee one driver. A
+    lease token is legitimate *in isolation* — signed by the app, unexpired,
+    bound to the person presenting it — so if the control plane ever hands the
+    lease to two people at once, every check below passes for both of them and
+    the arm obeys two browsers.
+
+    That is not hypothetical. The web app's fallback lease store is in-process,
+    so a deployment running more than one instance of it granted control
+    independently in each, and Cloudflare Workers runs many — an operator and
+    the owner drove the same arm at once. The app now keeps the lease in one
+    shared place; this class is why that is not the only thing standing between
+    the hardware and two operators.
+
+    This process is the single point every client of this one robot passes
+    through, so it is the only place that can hold the invariant whatever the
+    control plane believes. The first valid token seen takes the lease and
+    keeps it until it lapses; anybody else's token is refused meanwhile,
+    exactly as if they held none.
+    """
 
     def __init__(self, secret: str, lab_slug: str):
         self.secret = secret
         self.lab_slug = lab_slug
+        # Who is driving, and the expiry of the newest token they have shown.
+        # Deliberately not persisted: a restart drops every socket, so there is
+        # nobody left to protect an incumbent from.
+        self._holder: Optional[str] = None
+        self._holder_until = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -212,7 +237,48 @@ class LeaseVerifier:
             return False
         # A lease token is bound to one person: replaying someone else's does
         # not grant control.
-        return str(claims.get('sub')) == identity.user_id
+        if str(claims.get('sub')) != identity.user_id:
+            return False
+        return self._claim(identity.user_id, float(claims['exp']))
+
+    def _claim(self, user_id: str, expires: float) -> bool:
+        """Take or refresh the lease, unless somebody else still holds it."""
+        now = time.time()
+        held = self._holder is not None and now < self._holder_until
+        if held and self._holder != user_id:
+            log.warning(
+                '[lease] refused %s: %s is driving for another %.0fs — two '
+                'clients hold a valid lease token, so the control plane has '
+                'granted control twice',
+                user_id,
+                self._holder,
+                self._holder_until - now,
+            )
+            return False
+        # Extending rather than overwriting: a client with two tabs open shows
+        # tokens of different ages, and the lease should follow the newest.
+        self._holder_until = max(self._holder_until, expires) if held else expires
+        self._holder = user_id
+        return True
+
+    def release(self, user_id: str) -> None:
+        """Give the lease up early, if this is the person who holds it.
+
+        A cooperative browser clears its token the moment the state stream says
+        somebody else is driving. Honouring that immediately is what keeps an
+        admin's force from having to wait out the displaced operator's last
+        token; without it the takeover is still correct, just up to one token
+        lifetime slower.
+        """
+        if self._holder == user_id:
+            self._holder = None
+            self._holder_until = 0.0
+
+    @property
+    def held(self) -> bool:
+        """True while somebody's lease claim is live. Identity is deliberately
+        not exposed: /health answers unauthenticated callers."""
+        return self._holder is not None and time.time() < self._holder_until
 
 
 async def probe_jwks(session: aiohttp.ClientSession, url: str) -> bool:

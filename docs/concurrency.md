@@ -18,9 +18,28 @@ see and do.
 
 ## The lease
 
-Control is a lease with a **15 s TTL** (`LEASE_TTL_MS`), held in Redis
-(`REDIS_URL`) or in memory when Redis is absent — identical semantics,
-implemented once and shared by both backends.
+Control is a lease with a **15 s TTL** (`LEASE_TTL_MS`). One set of semantics,
+implemented once, applied to state that lives in one of three places:
+
+| Backend | Where the state lives | Shared? |
+| --- | --- | --- |
+| `durable-object` | a Cloudflare Durable Object, one per lab slug | ✔ |
+| `redis` | `REDIS_URL`, with Pub/Sub fan-out | ✔ |
+| `memory` | this process | ✘ |
+
+**The semantics are not what makes one controller true — the sharing is.** The
+in-memory store was described here as having "identical semantics", and it
+does; what it does not have is a single copy of the state. On Cloudflare
+Workers `globalThis` is per isolate, so a deployment with no shared store gave
+every isolate its own lease and granted control to as many people as there were
+isolates. Two of them both drove the arm.
+
+So the app refuses to mint a lease token from an unshared store when it is
+running on a multi-instance runtime (`ControlStore.shared`). The lab goes
+view-only — the same failure mode as a missing signing secret — rather than
+handing the hardware to two people. Production gets the Durable Object from the
+`CONTROL_LEASE` binding in `wrangler.jsonc`; `next dev` and the lease test are
+one process, so memory is genuinely shared there and is used as before.
 
 - `POST /api/control/take` — grant if free and nobody queued ahead; otherwise
   join the wait queue and return the position.
@@ -47,8 +66,8 @@ one does not stop the other. Everything below is scoped to a single lab.
 
 ## Reaching the hardware with it
 
-The lease lives in Redis, on Cloudflare. The hardware is on a Raspberry Pi
-behind an outbound-only tunnel and cannot see Redis at all. So "I hold the
+The lease lives on Cloudflare. The hardware is on a Raspberry Pi behind an
+outbound-only tunnel and cannot see the lease store at all. So "I hold the
 lease" travels to the edge as a **short-lived signed token**:
 
 ```text
@@ -64,6 +83,28 @@ expires, the token stops being reissued and the hardware stops accepting motion
 within one token lifetime — no revocation message has to arrive for the arm to
 become safe. With the secret unset the app cannot mint tokens at all, and the
 lab is view-only rather than open.
+
+### The gatekeeper arbitrates too
+
+A lease token is verifiable on its own — signed, unexpired, bound to the person
+presenting it — which means two of them, minted for two people, both pass. That
+is exactly what happened, and every check on the edge passed for both. So the
+gatekeeper no longer takes a valid token as the end of the question: it admits
+the **first** valid token it sees and refuses anybody else's while that one is
+still live (`LeaseVerifier`, `edge/gateway/primbio_gateway/auth.py`).
+
+It is the only process that sees every client of this one robot, so it is the
+only place the invariant can be held independently of what the control plane
+believes. Two consequences worth knowing:
+
+- A displaced operator's browser clears its token as soon as the state stream
+  says somebody else is driving, and the gatekeeper releases the claim on that,
+  on disconnect, or when the token lapses. A **force therefore takes effect at
+  once in the normal case**, and within one token lifetime (10 s) if the
+  outgoing browser does not cooperate.
+- Refusing the lease never refuses a **stop**. Stops require the operator role
+  and nothing else, and that is tested from a client the arbiter has just
+  turned down.
 
 ## Emergency stop
 
@@ -114,9 +155,9 @@ hardware.
 ## Verifying it
 
 ```bash
-node --experimental-strip-types scripts/test-control-lease.mjs
-REDIS_URL=redis://localhost:6379 \
-  node --experimental-strip-types scripts/test-control-lease.mjs
+npm run test:lease                                   # memory backend
+REDIS_URL=redis://localhost:6379 npm run test:lease  # redis backend
+npm run test:gateway                                 # the edge, including the arbiter
 ```
 
 Covers: two labs each holding their own controller at once; a second operator
@@ -128,6 +169,12 @@ and leaves the previous holder unable to drive or to reclaim it; only the real
 holder can accept, and only a request that was actually made; e-stop is
 recorded from someone holding nothing and does not cross labs; and every
 mutation reaches a subscriber. Both backends must pass identically.
+
+What no single-process test can cover is the failure that actually happened —
+one store per instance — because there is only ever one instance under test.
+That gap is closed from the other end: `npm run test:gateway` puts two clients
+holding two valid lease tokens on one gatekeeper and asserts that only one of
+them moves the arm, and that the refused one can still stop it.
 
 The edge half is covered by `edge/gateway/tests/` — in particular that a viewer
 who does nothing still receives the operator's commands, and that a viewer's

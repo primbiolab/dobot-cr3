@@ -19,6 +19,6 @@ export async function POST() {
   // Refreshing the lease refreshes the token that proves it. This is also how
   // a client that inherits the lease from the queue starts being allowed to
   // actuate: it simply gets a token on its next beat.
-  const leaseToken = result.granted ? await mintLeaseToken(auth.user) : null;
+  const leaseToken = result.granted ? await mintLeaseToken(auth.user, store) : null;
   return NextResponse.json({ ...result, leaseToken });
 }

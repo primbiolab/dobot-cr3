@@ -1,12 +1,13 @@
 import { SignJWT } from "jose";
 import { getLabSlug } from "@/lib/lab";
-import type { ControlUser } from "./store";
+import { isMultiInstanceRuntime } from "./store";
+import type { ControlStore, ControlUser } from "./store";
 
-// The credential that ties this app's Redis lease to the hardware.
+// The credential that ties this app's control lease to the hardware.
 //
-// The edge gatekeeper cannot see Redis — it sits on the lab computer behind an
-// outbound-only tunnel — so "does this person currently hold control?" has to
-// travel to it as something unforgeable. That is this token: signed with a
+// The edge gatekeeper cannot see the lease store — it sits on the lab computer
+// behind an outbound-only tunnel — so "does this person currently hold
+// control?" has to travel to it as something unforgeable. That is this token: signed with a
 // secret shared only between this app and the gatekeeper, bound to one user
 // and one lab, and deliberately short-lived.
 //
@@ -35,10 +36,28 @@ function getSecret(): Uint8Array | null {
 }
 
 /**
- * Mint a lease token for the current holder. Returns null when signing is not
- * configured, which leaves the lab view-only rather than failing open.
+ * Mint a lease token for the current holder. Returns null when the lab has no
+ * business handing out hardware credentials, which leaves it view-only rather
+ * than failing open. Two reasons for that:
+ *
+ * 1. Signing is not configured, so there is no shared secret with the edge.
+ * 2. The store that granted the lease speaks only for this instance, and there
+ *    is more than one instance. This is the check that would have caught the
+ *    two-controllers bug: the in-memory store is per-isolate, so on Workers it
+ *    granted the lease to an operator and to the owner independently and both
+ *    were minted a valid token. A token is a claim about the whole lab, so it
+ *    may only be signed by a store that can speak for the whole lab.
+ *
+ * Taking the store as an argument rather than reaching for it makes that
+ * second check impossible to forget: minting is the only way to get a
+ * credential, and this is the only way to mint.
  */
-export async function mintLeaseToken(user: ControlUser): Promise<string | null> {
+export async function mintLeaseToken(
+  user: ControlUser,
+  store: ControlStore,
+): Promise<string | null> {
+  if (!store.shared && isMultiInstanceRuntime()) return null;
+
   const secret = getSecret();
   if (!secret) return null;
 

@@ -1,11 +1,22 @@
 // Hardware control plane: one active controller per lab, everyone else
 // spectates. The lease is a 15 s TTL entry extended by client heartbeats —
 // a crashed or disconnected controller releases the hardware automatically.
-// Redis is the production store (multi-instance + Pub/Sub fan-out); without
-// REDIS_URL an in-memory store keeps a single instance fully functional.
+//
+// Three backends, one set of semantics. What separates them is only *where the
+// state lives*, and that turns out to be the whole safety property: a store
+// that is not shared by every instance of this app does not enforce one
+// controller, it enforces one controller per instance. Read `shared` below
+// before adding a fourth.
+//
+//   durable-object  Cloudflare Durable Object — production. One instance per
+//                   lab, globally, whatever Cloudflare does with isolates.
+//   redis           REDIS_URL — shared across instances, with Pub/Sub fan-out.
+//   memory          Neither configured. Single process only: `next dev`, the
+//                   lease test, and demo mode.
 
 import { EventEmitter } from "node:events";
 import type { RedisClientType } from "redis";
+import type { LeaseCall, LeaseReply } from "./lease-do";
 
 export const LEASE_TTL_MS = 15_000;
 export const QUEUE_TTL_MS = 30_000;
@@ -32,13 +43,13 @@ export interface TakeResult {
   position: number; // 0 = holder, 1 = next in line…
 }
 
-interface Entry {
+export interface Entry {
   user: ControlUser;
   joined: number;
   last: number;
 }
 
-interface StoreState {
+export interface StoreState {
   holder: { user: ControlUser; expires: number } | null;
   queue: Map<string, Entry>;
   presence: Map<string, Entry>;
@@ -49,7 +60,7 @@ interface StoreState {
 
 // ── Core semantics (shared by both backends via a JSON state blob) ──────────
 
-function prune(s: StoreState, now: number): void {
+export function prune(s: StoreState, now: number): void {
   if (s.holder && s.holder.expires <= now) s.holder = null;
   for (const [id, e] of s.queue) if (now - e.last > QUEUE_TTL_MS) s.queue.delete(id);
   for (const [id, e] of s.presence) if (now - e.last > PRESENCE_TTL_MS) s.presence.delete(id);
@@ -64,7 +75,7 @@ function prune(s: StoreState, now: number): void {
 // for the lease to lapse — and unlike an admin force, this needs the holder to
 // agree, so it is the polite path between two operators who are both entitled
 // to drive.
-function requestHandover(s: StoreState, user: ControlUser, now: number): boolean {
+export function requestHandover(s: StoreState, user: ControlUser, now: number): boolean {
   prune(s, now);
   if (!s.holder || s.holder.user.id === user.id) return false;
   const existing = s.handovers.get(user.id);
@@ -78,7 +89,7 @@ function requestHandover(s: StoreState, user: ControlUser, now: number): boolean
 
 // The holder agrees. Control moves in one step: there is no window where both
 // of them hold it, and none where neither does.
-function acceptHandover(
+export function acceptHandover(
   s: StoreState,
   holderId: string,
   toUserId: string,
@@ -95,7 +106,7 @@ function acceptHandover(
   return incoming.user;
 }
 
-function declineHandover(s: StoreState, holderId: string, fromUserId: string, now: number): boolean {
+export function declineHandover(s: StoreState, holderId: string, fromUserId: string, now: number): boolean {
   prune(s, now);
   if (s.holder?.user.id !== holderId) return false;
   return s.handovers.delete(fromUserId);
@@ -105,7 +116,7 @@ function orderedQueue(s: StoreState): Entry[] {
   return [...s.queue.values()].sort((a, b) => a.joined - b.joined);
 }
 
-function tryAcquire(s: StoreState, user: ControlUser, now: number): TakeResult {
+export function tryAcquire(s: StoreState, user: ControlUser, now: number): TakeResult {
   prune(s, now);
   if (!s.holder || s.holder.user.id === user.id) {
     // Free (or already ours): grant only if we are first in line or the
@@ -138,7 +149,7 @@ function tryAcquire(s: StoreState, user: ControlUser, now: number): TakeResult {
 // displaced holder finds out the same way everyone else does — the state
 // stream — and their next heartbeat returns no lease token, so their commands
 // stop being authorized within one heartbeat interval.
-function forceAcquire(s: StoreState, user: ControlUser, now: number): TakeResult {
+export function forceAcquire(s: StoreState, user: ControlUser, now: number): TakeResult {
   prune(s, now);
   s.holder = { user, expires: now + LEASE_TTL_MS };
   s.queue.delete(user.id);
@@ -151,7 +162,7 @@ function position(s: StoreState, userId: string): number {
   return idx === -1 ? q.length + 1 : idx + 1;
 }
 
-function heartbeat(s: StoreState, user: ControlUser, now: number): TakeResult {
+export function heartbeat(s: StoreState, user: ControlUser, now: number): TakeResult {
   prune(s, now);
   if (s.holder?.user.id === user.id) {
     s.holder.expires = now + LEASE_TTL_MS;
@@ -166,7 +177,7 @@ function heartbeat(s: StoreState, user: ControlUser, now: number): TakeResult {
   return { granted: false, position: position(s, user.id) };
 }
 
-function release(s: StoreState, userId: string, now: number): boolean {
+export function release(s: StoreState, userId: string, now: number): boolean {
   prune(s, now);
   if (s.holder?.user.id === userId) {
     s.holder = null;
@@ -176,12 +187,12 @@ function release(s: StoreState, userId: string, now: number): boolean {
   return false;
 }
 
-function touchPresence(s: StoreState, user: ControlUser, now: number): void {
+export function touchPresence(s: StoreState, user: ControlUser, now: number): void {
   const e = s.presence.get(user.id);
   s.presence.set(user.id, { user, joined: e?.joined ?? now, last: now });
 }
 
-function publicState(s: StoreState, now: number): ControlState {
+export function publicState(s: StoreState, now: number): ControlState {
   prune(s, now);
   return {
     holder: s.holder?.user ?? null,
@@ -199,7 +210,7 @@ function publicState(s: StoreState, now: number): ControlState {
 
 // ── Serialization for the Redis backend ─────────────────────────────────────
 
-interface WireState {
+export interface WireState {
   holder: { user: ControlUser; expires: number } | null;
   queue: Entry[];
   presence: Entry[];
@@ -208,7 +219,7 @@ interface WireState {
   estopBy: string | null;
 }
 
-function toWire(s: StoreState): WireState {
+export function toWire(s: StoreState): WireState {
   return {
     holder: s.holder,
     queue: [...s.queue.values()],
@@ -219,7 +230,7 @@ function toWire(s: StoreState): WireState {
   };
 }
 
-function fromWire(w: WireState | null): StoreState {
+export function fromWire(w: WireState | null): StoreState {
   return {
     holder: w?.holder ?? null,
     queue: new Map((w?.queue ?? []).map((e) => [e.user.id, e])),
@@ -233,7 +244,16 @@ function fromWire(w: WireState | null): StoreState {
 // ── Store interface ─────────────────────────────────────────────────────────
 
 export interface ControlStore {
-  readonly backend: "redis" | "memory";
+  readonly backend: "durable-object" | "redis" | "memory";
+  /**
+   * True when every instance of this app sees the same lease.
+   *
+   * False means this store speaks only for the process it lives in, so "the
+   * lease is free" means "free as far as I know". No lease token may be minted
+   * against a store like that on a multi-instance runtime — see
+   * `mintLeaseToken`, which is where that is enforced.
+   */
+  readonly shared: boolean;
   take(labId: string, user: ControlUser): Promise<TakeResult>;
   /** Seize the lease regardless of who holds it. Admins only — see route. */
   force(labId: string, user: ControlUser): Promise<TakeResult>;
@@ -255,6 +275,8 @@ export interface ControlStore {
 
 class MemoryStore implements ControlStore {
   readonly backend = "memory" as const;
+  // One process's opinion. Correct when there is only one process.
+  readonly shared = false;
   private labs = new Map<string, StoreState>();
   private bus = new EventEmitter();
 
@@ -337,6 +359,7 @@ class MemoryStore implements ControlStore {
 
 class RedisStore implements ControlStore {
   readonly backend = "redis" as const;
+  readonly shared = true;
 
   private client: RedisClientType;
   private subClient: RedisClientType;
@@ -444,6 +467,133 @@ class RedisStore implements ControlStore {
   }
 }
 
+// ── Durable Object backend (production on Cloudflare Workers) ───────────────
+// The state and the semantics live inside the object itself (lease-do.ts);
+// this is the client. Every call is one request to the object named after the
+// lab, and every reply carries the new public state, so a mutation and the
+// broadcast that follows it are always consistent with each other.
+
+// How often a spectator's stream re-reads the object. There is no Pub/Sub to
+// subscribe to, so this is both the fan-out latency and a per-viewer request
+// cost: a viewer sees control change hands within this long, and each open tab
+// costs one request to the lease object per interval for as long as it is
+// open. Two seconds is well inside the 15 s lease TTL and keeps a classroom of
+// spectators to a few requests a second.
+const DO_POLL_MS = 2000;
+
+interface LeaseStub {
+  fetch(input: string, init?: RequestInit): Promise<Response>;
+}
+
+interface LeaseNamespace {
+  idFromName(name: string): unknown;
+  get(id: unknown): LeaseStub;
+}
+
+class DurableObjectStore implements ControlStore {
+  readonly backend = "durable-object" as const;
+  readonly shared = true;
+
+  private async call<T>(labId: string, body: LeaseCall): Promise<LeaseReply<T>> {
+    const ns = await getLeaseNamespace();
+    if (!ns) throw new Error("control store: CONTROL_LEASE binding unavailable");
+    // Resolved per call rather than held: a binding belongs to the request
+    // context it was taken from, and this store outlives any one request.
+    const stub = ns.get(ns.idFromName(labId));
+    const response = await stub.fetch("https://control.lease/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      throw new Error(`control store: lease object returned ${response.status}`);
+    }
+    return (await response.json()) as LeaseReply<T>;
+  }
+
+  async take(id: string, user: ControlUser): Promise<TakeResult> {
+    return (await this.call<TakeResult>(id, { op: "take", user })).result;
+  }
+  async force(id: string, user: ControlUser): Promise<TakeResult> {
+    return (await this.call<TakeResult>(id, { op: "force", user })).result;
+  }
+  async heartbeat(id: string, user: ControlUser): Promise<TakeResult> {
+    return (await this.call<TakeResult>(id, { op: "heartbeat", user })).result;
+  }
+  async requestHandover(id: string, user: ControlUser): Promise<boolean> {
+    return (await this.call<boolean>(id, { op: "requestHandover", user })).result;
+  }
+  async acceptHandover(id: string, holderId: string, toUserId: string): Promise<boolean> {
+    return (
+      await this.call<boolean>(id, { op: "acceptHandover", holderId, toUserId })
+    ).result;
+  }
+  async declineHandover(id: string, holderId: string, fromUserId: string): Promise<boolean> {
+    return (
+      await this.call<boolean>(id, { op: "declineHandover", holderId, fromUserId })
+    ).result;
+  }
+  async release(id: string, userId: string): Promise<void> {
+    await this.call(id, { op: "release", userId });
+  }
+  async estop(id: string, by: ControlUser): Promise<void> {
+    await this.call(id, { op: "estop", user: by });
+  }
+  async joinPresence(id: string, user: ControlUser): Promise<void> {
+    await this.call(id, { op: "joinPresence", user });
+  }
+  async leavePresence(id: string, userId: string): Promise<void> {
+    await this.call(id, { op: "leavePresence", userId });
+  }
+  async state(id: string): Promise<ControlState> {
+    return (await this.call(id, { op: "state" })).state;
+  }
+
+  async subscribe(id: string, fn: (s: ControlState) => void): Promise<() => void> {
+    // Polled rather than pushed. A Durable Object could hold the sockets and
+    // push, but that would move the SSE endpoint into it for a second of
+    // latency; the route already only writes a frame when the state differs.
+    let last: string | null = null;
+    const tick = async () => {
+      try {
+        const state = await this.state(id);
+        const frame = JSON.stringify(state);
+        if (frame === last) return;
+        last = frame;
+        fn(state);
+      } catch {
+        // Transient: the next tick tries again. A stream that stops updating
+        // is recoverable; one that throws here would close on every blip.
+      }
+    };
+    const timer = setInterval(tick, DO_POLL_MS);
+    return () => clearInterval(timer);
+  }
+}
+
+/**
+ * The lease object's namespace binding, or null when this is not running on
+ * Workers — `next dev`, the lease test, `next build`.
+ */
+async function getLeaseNamespace(): Promise<LeaseNamespace | null> {
+  try {
+    const { getCloudflareContext } = await import("@opennextjs/cloudflare");
+    const { env } = await getCloudflareContext({ async: true });
+    const ns = (env as unknown as { CONTROL_LEASE?: LeaseNamespace }).CONTROL_LEASE;
+    return ns ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when this process is one of many serving the same app, so a store that
+ * is not shared cannot be trusted to say who holds the lease.
+ */
+export function isMultiInstanceRuntime(): boolean {
+  return globalThis.navigator?.userAgent === "Cloudflare-Workers";
+}
+
 // ── Singleton ───────────────────────────────────────────────────────────────
 
 declare global {
@@ -451,6 +601,10 @@ declare global {
 }
 
 async function build(): Promise<ControlStore> {
+  // The lease object first: on Workers it is the only backend that can hold
+  // the invariant, and it needs no configuration beyond its binding.
+  if (await getLeaseNamespace()) return new DurableObjectStore();
+
   const url = process.env.REDIS_URL;
   if (url) {
     try {
@@ -465,6 +619,17 @@ async function build(): Promise<ControlStore> {
         `control store: Redis unavailable (${(e as Error).message}); using in-memory store`,
       );
     }
+  }
+
+  if (isMultiInstanceRuntime()) {
+    // Loud, because the lab is about to be view-only and the reason is a
+    // missing binding rather than anything an operator did. Granting control
+    // from a per-isolate store is the failure this refuses to repeat.
+    console.error(
+      "control store: no CONTROL_LEASE binding and no REDIS_URL on a " +
+        "multi-instance runtime — the lease cannot be shared, so no lease " +
+        "token will be minted and the lab stays view-only.",
+    );
   }
   return new MemoryStore();
 }

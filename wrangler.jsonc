@@ -15,7 +15,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "dobot-cr3",
-  "main": ".open-next/worker.js",
+  // worker/index.ts re-exports the generated OpenNext worker and adds the
+  // control-lease Durable Object, which Cloudflare requires to be exported
+  // from the entry module.
+  "main": "worker/index.ts",
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
@@ -25,6 +28,18 @@
   "observability": {
     "enabled": true
   },
+  // The control lease. One instance per lab slug, globally — this is what
+  // makes "one active controller" true across every isolate Cloudflare runs.
+  // Without this binding the app falls back to a per-instance store, refuses
+  // to mint lease tokens and the lab goes view-only (src/lib/control/store.ts).
+  "durable_objects": {
+    "bindings": [
+      { "name": "CONTROL_LEASE", "class_name": "ControlLeaseDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ControlLeaseDO"] }
+  ],
   "workers_dev": true,
   "routes": [{ "pattern": "dobot-cr3.primbiolab.org", "custom_domain": true }]
 }

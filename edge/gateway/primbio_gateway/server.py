@@ -216,6 +216,7 @@ class Gateway:
                 pump.cancel()
             await asyncio.gather(*pumps, return_exceptions=True)
             self.sessions.discard(session)
+            self._release_lease(session)
             await self.announce_presence('leave', session)
             log.info(
                 '[ws] %s disconnected — %d viewer(s)', identity.name, len(self.sessions)
@@ -287,6 +288,12 @@ class Gateway:
         # Lease refresh is ours, not the bridge's: never forwarded.
         if op == 'lease':
             session.lease_token = str(message.get('token') or '')
+            # An empty token is the browser saying it has stopped driving —
+            # which it does as soon as the state stream tells it somebody else
+            # is. Letting go of the claim here is what makes a handover or an
+            # admin force take effect at once instead of one token later.
+            if not session.lease_token:
+                self._release_lease(session)
             await session.ws.send_str(
                 json.dumps(
                     {'op': 'leaseAck', 'holdsLease': session.holds_lease(self.leases)}
@@ -380,6 +387,21 @@ class Gateway:
                 await session.ws.send_bytes(msg.data)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
                 break
+
+    def _release_lease(self, session: Session) -> None:
+        """Drop this person's claim on the lease — unless they are still
+        driving from somewhere else.
+
+        Two tabs of the same person are two sessions (Session is compared by
+        identity, not by value), so one of them closing or standing down must
+        not hand the arm to the next claimant while the other is still holding
+        a token.
+        """
+        user_id = session.identity.user_id
+        for other in self.sessions:
+            if other is not session and other.identity.user_id == user_id and other.lease_token:
+                return
+        self.leases.release(user_id)
 
     async def _deny(
         self,
@@ -644,6 +666,7 @@ class Gateway:
                 'lab': self.config.lab_slug,
                 'viewers': len(self.sessions),
                 'leaseVerification': self.leases.enabled,
+                'leaseHeld': self.leases.held,
                 'bridge': self.config.bridge_url,
             }
         )

@@ -29,6 +29,6 @@ export async function POST() {
 
   const store = await getControlStore();
   const result = await store.force(getLabSlug(), auth.user);
-  const leaseToken = result.granted ? await mintLeaseToken(auth.user) : null;
+  const leaseToken = result.granted ? await mintLeaseToken(auth.user, store) : null;
   return NextResponse.json({ ...result, leaseToken });
 }

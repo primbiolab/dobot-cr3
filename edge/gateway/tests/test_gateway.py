@@ -30,6 +30,7 @@ PROJECT_ID = 'cbadb67c-2001-4c1e-bea1-99e3199f3fa2'
 
 OPERATOR = Identity('u-op', 'op@unal.edu.co', 'María Gómez', 'operator')
 VIEWER = Identity('u-view', 'view@unal.edu.co', 'Juan Pérez', 'viewer')
+OWNER = Identity('u-owner', 'owner@unal.edu.co', 'Sofía Ruiz', 'owner')
 
 # Service ids the fake bridge advertises.
 SERVICES = {10: '/weblab/jog', 11: '/weblab/estop', 12: '/weblab/enable'}
@@ -314,6 +315,144 @@ def test_expired_and_foreign_lease_tokens_are_rejected():
                 ws, hello = await connect(session, harness, 'op-token', forged)
                 assert hello['holdsLease'] is False
                 await ws.close()
+        finally:
+            await harness.stop()
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_only_one_of_two_lease_holders_can_move_the_arm():
+    """The regression this guard exists for.
+
+    The web app handed control to an operator and to the owner at the same
+    time — its in-memory lease store is per-instance, and the deployment runs
+    many. Both tokens are genuine, so nothing about either one is refusable on
+    its own merits. The gatekeeper is the only process that sees both, and it
+    is what has to keep the arm down to one driver.
+    """
+
+    async def scenario():
+        bridge = FakeBridge()
+        await bridge.start()
+        harness = GatewayHarness(
+            bridge, {'op-token': OPERATOR, 'owner-token': OWNER}
+        )
+        await harness.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                first, hello = await connect(
+                    session, harness, 'op-token', lease_token(OPERATOR)
+                )
+                assert hello['holdsLease'] is True
+                assert await read_until(first, 'advertiseServices')
+
+                second, hello = await connect(
+                    session, harness, 'owner-token', lease_token(OWNER)
+                )
+                assert hello['holdsLease'] is False, (
+                    'two clients were told they hold the same lease'
+                )
+                assert await read_until(second, 'advertiseServices')
+
+                # Both ask the arm to move. Only the operator's call arrives.
+                await first.send_bytes(service_call_frame(12, 1))
+                await second.send_bytes(service_call_frame(12, 2))
+                assert await read_until(second, 'denied') is not None
+                await asyncio.sleep(0.2)
+                assert len(bridge.received) == 1, (
+                    'the arm took commands from two people at once'
+                )
+
+                # The owner can still stop it: a stop never needs the lease,
+                # and that must survive being refused the lease.
+                await second.send_bytes(service_call_frame(11, 3))
+                await asyncio.sleep(0.2)
+                assert len(bridge.received) == 2
+
+                await first.close()
+                await second.close()
+        finally:
+            await harness.stop()
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_standing_down_lets_the_next_operator_drive():
+    """A displaced operator's browser clears its token as soon as the state
+    stream says somebody else is driving. That must hand the arm over at once,
+    not one token lifetime later."""
+
+    async def scenario():
+        bridge = FakeBridge()
+        await bridge.start()
+        harness = GatewayHarness(
+            bridge, {'op-token': OPERATOR, 'owner-token': OWNER}
+        )
+        await harness.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                first, _ = await connect(
+                    session, harness, 'op-token', lease_token(OPERATOR)
+                )
+                assert await read_until(first, 'advertiseServices')
+                second, hello = await connect(
+                    session, harness, 'owner-token', lease_token(OWNER)
+                )
+                assert hello['holdsLease'] is False
+                assert await read_until(second, 'advertiseServices')
+
+                await first.send_str(json.dumps({'op': 'lease', 'token': ''}))
+                ack = await read_until(first, 'leaseAck')
+                assert ack['holdsLease'] is False
+
+                # The owner's next refresh takes the lease.
+                await second.send_str(
+                    json.dumps({'op': 'lease', 'token': lease_token(OWNER)})
+                )
+                ack = await read_until(second, 'leaseAck')
+                assert ack['holdsLease'] is True
+
+                await second.send_bytes(service_call_frame(12, 1))
+                await asyncio.sleep(0.2)
+                assert len(bridge.received) == 1
+                await first.close()
+                await second.close()
+        finally:
+            await harness.stop()
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
+def test_a_disconnected_holder_frees_the_arm():
+    """The holder's tab dies. Nobody tells the gatekeeper anything except the
+    socket closing, and the lab must not stay locked until their token runs
+    out."""
+
+    async def scenario():
+        bridge = FakeBridge()
+        await bridge.start()
+        harness = GatewayHarness(
+            bridge, {'op-token': OPERATOR, 'owner-token': OWNER}
+        )
+        await harness.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                first, hello = await connect(
+                    session, harness, 'op-token', lease_token(OPERATOR)
+                )
+                assert hello['holdsLease'] is True
+                assert await read_until(first, 'advertiseServices')
+                await first.close()
+                await asyncio.sleep(0.2)
+
+                second, hello = await connect(
+                    session, harness, 'owner-token', lease_token(OWNER)
+                )
+                assert hello['holdsLease'] is True
+                await second.close()
         finally:
             await harness.stop()
             await bridge.stop()

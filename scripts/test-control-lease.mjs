@@ -265,6 +265,31 @@ await check("every mutation reaches a subscriber", async () => {
   );
 });
 
+// ── The store has to be able to speak for the whole lab ────────────────────
+//
+// Every check above runs inside one process, which is exactly the assumption
+// that broke in production: the in-memory store was serving a deployment made
+// of many isolates, so each of them granted the lease to a different person
+// and both were minted a valid token. No single-process test can catch that.
+// What it can do is pin the flag the mint keys off, so a store that only
+// speaks for itself can never quietly start handing out hardware credentials.
+
+console.log("\nspeaking for the whole lab");
+
+await check("a store declares whether it is shared", async () => {
+  assert.equal(
+    typeof store.shared,
+    "boolean",
+    "every backend must say whether all instances see the same lease",
+  );
+  const expected = { memory: false, redis: true, "durable-object": true };
+  assert.equal(
+    store.shared,
+    expected[store.backend],
+    `the ${store.backend} backend reports the wrong sharing`,
+  );
+});
+
 console.log(
   failures === 0
     ? "\nall control-lease checks passed"

@@ -31,6 +31,13 @@ browser ──wss──► dobot-cr3-control.primbiolab.org ──► gatekeeper
    Everything not explicitly named is denied, and the raw driver services
    (`/dobot_cr3_bringup/srv/*`) are never exposed — only the vetted `/weblab/*`
    surface.
+   A valid lease token is necessary but not sufficient: two tokens minted for
+   two people are each valid on their own, so `LeaseVerifier` also arbitrates
+   between them. The first live token takes the lease and anybody else's is
+   refused until it lapses, is cleared by its browser, or its socket closes.
+   This process is the only one that sees every client of this robot, so it is
+   the only place that can hold "one driver" whatever the web app believes —
+   and the web app did once believe two.
 3. **Fans out what the operator is doing.** Every authorized command is
    broadcast to *all* connected sessions as an `activity` frame carrying the
    name of the person who issued it, so a spectator can tell a deliberate move
@@ -75,4 +82,6 @@ whole thing against a stand-in bridge and asserts the behaviour this lab exists
 for: a viewer who does nothing still sees the operator's commands, a viewer's
 own command is refused and never reaches ROS, an operator without the lease
 cannot move the arm but can still stop it, and forged, expired or borrowed
-lease tokens grant nothing.
+lease tokens grant nothing. It also covers the two-driver case directly: two
+clients arrive holding two genuine lease tokens, only one of them moves the
+arm, and the one that was refused can still stop it.

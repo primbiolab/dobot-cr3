@@ -17,6 +17,6 @@ export async function POST() {
   const result = await store.take(getLabSlug(), auth.user);
   // The token travels with the grant: the client presents it to the edge
   // gatekeeper, which has no other way to know who holds the lease.
-  const leaseToken = result.granted ? await mintLeaseToken(auth.user) : null;
+  const leaseToken = result.granted ? await mintLeaseToken(auth.user, store) : null;
   return NextResponse.json({ ...result, leaseToken });
 }

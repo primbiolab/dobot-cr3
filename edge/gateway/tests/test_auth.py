@@ -21,7 +21,12 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from primbio_gateway.auth import AuthError, TokenVerifier  # noqa: E402
+from primbio_gateway.auth import (  # noqa: E402
+    AuthError,
+    Identity,
+    LeaseVerifier,
+    TokenVerifier,
+)
 
 SECRET = 'test-secret-at-least-32-characters-long!'
 PROJECT_ID = '11111111-1111-1111-1111-111111111111'
@@ -108,3 +113,95 @@ def test_token_signed_with_another_secret_is_rejected():
     )
     with pytest.raises(AuthError):
         verifier().verify(forged)
+
+
+# ── One driver, whatever the control plane says ─────────────────────────────
+#
+# The lease token is verified in isolation, so two valid tokens for two
+# different people both pass on their own merits. These cover the arbitration
+# that stops the second one from reaching the arm — the property the web app's
+# lease store is supposed to guarantee and, on a multi-instance deployment,
+# did not.
+
+LAB = 'dobot-cr3'
+LEASE_SECRET = 'lease-secret-at-least-32-characters-long'
+
+ANA = Identity('u-ana', 'ana@unal.edu.co', 'Ana', 'operator')
+BETO = Identity('u-beto', 'beto@unal.edu.co', 'Beto', 'owner')
+
+
+def lease(identity, ttl=10):
+    # Whole seconds: `exp` has no finer resolution, so a fractional TTL would
+    # round down to "already expired" and make these tests flap.
+    return jwt.encode(
+        {'sub': identity.user_id, 'aud': LAB, 'exp': int(time.time()) + ttl},
+        LEASE_SECRET,
+        algorithm='HS256',
+    )
+
+
+def leases():
+    return LeaseVerifier(LEASE_SECRET, LAB)
+
+
+def test_two_valid_lease_tokens_do_not_both_drive():
+    """The bug this exists for: the app granted control to an operator and to
+    the owner at the same time, and both tokens were perfectly valid."""
+    verifier = leases()
+    assert verifier.holds_lease(lease(ANA), ANA) is True
+    assert verifier.holds_lease(lease(BETO), BETO) is False
+    # And Ana keeps driving — being challenged does not cost her the lease.
+    assert verifier.holds_lease(lease(ANA), ANA) is True
+
+
+def test_the_holder_can_refresh_indefinitely():
+    verifier = leases()
+    for _ in range(5):
+        assert verifier.holds_lease(lease(ANA), ANA) is True
+    assert verifier.held is True
+
+
+def test_a_lapsed_claim_frees_the_lease():
+    """Nothing has to arrive for the arm to become available again: the
+    incumbent's last token simply runs out."""
+    verifier = leases()
+    assert verifier.holds_lease(lease(ANA, ttl=1), ANA) is True
+    time.sleep(1.2)
+    assert verifier.held is False
+    assert verifier.holds_lease(lease(BETO), BETO) is True
+
+
+def test_standing_down_hands_over_at_once():
+    verifier = leases()
+    assert verifier.holds_lease(lease(ANA), ANA) is True
+    verifier.release(ANA.user_id)
+    assert verifier.holds_lease(lease(BETO), BETO) is True
+    # Ana is now the one refused.
+    assert verifier.holds_lease(lease(ANA), ANA) is False
+
+
+def test_releasing_somebody_elses_lease_does_nothing():
+    verifier = leases()
+    assert verifier.holds_lease(lease(ANA), ANA) is True
+    verifier.release(BETO.user_id)
+    assert verifier.holds_lease(lease(BETO), BETO) is False
+
+
+def test_an_invalid_token_never_claims_the_lease():
+    verifier = leases()
+    forged = jwt.encode(
+        {'sub': BETO.user_id, 'aud': LAB, 'exp': int(time.time() + 60)},
+        'not-the-lease-secret-but-long-enough!!',
+        algorithm='HS256',
+    )
+    assert verifier.holds_lease(forged, BETO) is False
+    assert verifier.holds_lease(lease(ANA, ttl=-5), ANA) is False
+    # Replaying somebody else's live token does not claim it either.
+    assert verifier.holds_lease(lease(ANA), BETO) is False
+    assert verifier.held is False
+
+
+def test_without_a_secret_nobody_holds_anything():
+    verifier = LeaseVerifier('', LAB)
+    assert verifier.holds_lease(lease(ANA), ANA) is False
+    assert verifier.held is False
